@@ -2,19 +2,24 @@
 """
 embed_haptics_hls.py
 
-Embeds an AHAP haptic file into an HLS stream using three complementary methods:
+Embeds an AHAP haptic file into both an HLS stream and a standalone MP4.
 
-  Method 1 — EXT-X-DATERANGE in m3u8 (PRIMARY, seek-safe)
-    Base64-encoded AHAP lives inside the manifest.
+  HLS — Method 1: EXT-X-DATERANGE URL reference in m3u8 (PRIMARY, seek-safe)
+    X-HAPTICS-URL points to haptic.ahap served alongside the manifest.
     AVFoundation reads it via AVPlayerItemMetadataCollector.
 
-  Method 2 — Proper ID3 PES in MPEG-TS (LIVE STREAMING)
+  HLS — Method 2: Proper ID3 PES in MPEG-TS (LIVE STREAMING)
     ID3 tag embedded as a real stream_type=0x15 PES inside the TS container.
     PMT is updated with the new elementary stream + metadata_descriptor.
     AVFoundation reads it via AVPlayerItemMetadataOutput.
 
-  Method 3 — Direct sidecar file (FALLBACK)
+  HLS — Method 3: Direct sidecar file (FALLBACK)
     haptic.ahap copied to the output directory as a last resort.
+
+  MP4 — Method 4: ISOBMFF timed metadata track (CROSS-PLATFORM)
+    AHAP JSON injected as a 'mett' handler track inside the MP4 container.
+    iOS  → AVAssetReader reads the mett track → CHHapticEngine
+    Android → MediaExtractor reads the mett track → VibrationEffect
 
 Usage:
   python3 embed_haptics_hls.py \
@@ -24,6 +29,7 @@ Usage:
 
 Dependencies:
   - ffmpeg (must be on PATH)
+  - No external Python libraries required
 """
 
 import argparse
@@ -505,22 +511,21 @@ def parse_total_duration(playlist_path: str) -> float:
     return total
 
 
-def inject_daterange_into_m3u8(playlist_path: str, ahap_json: str) -> None:
+def inject_daterange_into_m3u8(playlist_path: str, ahap_filename: str = 'haptic.ahap') -> None:
     """
-    Embed base64-encoded AHAP as EXT-X-DATERANGE inside the m3u8 manifest.
+    Embed a URL reference to the AHAP sidecar file as EXT-X-DATERANGE inside the m3u8 manifest.
     AVFoundation reads this via AVPlayerItemMetadataCollector.
-    iOS attribute key: X-HAPTICS-DATA
+    iOS attribute key: X-HAPTICS-URL  (relative to manifest — resolved on the iOS side)
     """
-    total    = parse_total_duration(playlist_path)
-    ahap_b64 = base64.b64encode(ahap_json.encode()).decode('ascii')
-    anchor   = '2024-01-01T00:00:00.000Z'
+    total  = parse_total_duration(playlist_path)
+    anchor = '2024-01-01T00:00:00.000Z'
 
     block = (
         f'#EXT-X-PROGRAM-DATE-TIME:{anchor}\n'
         f'#EXT-X-DATERANGE:ID="haptics-0",'
         f'START-DATE="{anchor}",'
         f'DURATION={total:.3f},'
-        f'X-HAPTICS-DATA="{ahap_b64}"\n'
+        f'X-HAPTICS-URL="{ahap_filename}"\n'
     )
 
     with open(playlist_path) as f:
@@ -533,8 +538,329 @@ def inject_daterange_into_m3u8(playlist_path: str, ahap_json: str) -> None:
 
     print(
         f'[2/4] EXT-X-DATERANGE injected → {os.path.basename(playlist_path)}\n'
-        f'      duration={total:.3f}s  b64_size={len(ahap_b64)} chars'
+        f'      duration={total:.3f}s  X-HAPTICS-URL="{ahap_filename}"'
     )
+
+
+# ============================================================================
+# ISOBMFF helpers — MP4 timed metadata track injection
+# (raw struct, no external dependencies — same approach as MPEG-TS above)
+# ============================================================================
+
+def isobmff_box(fourcc: str, payload: bytes) -> bytes:
+    """Wrap payload in a standard 8-byte ISOBMFF box header."""
+    return struct.pack('>I4s', 8 + len(payload), fourcc.encode('latin-1')) + payload
+
+
+def isobmff_fullbox(fourcc: str, version: int, flags: int, payload: bytes) -> bytes:
+    """FullBox = box with version (1 byte) + flags (3 bytes) before payload."""
+    fb_header = bytes([version]) + struct.pack('>I', flags)[1:]  # flags is 3 bytes
+    return isobmff_box(fourcc, fb_header + payload)
+
+
+def parse_mp4_boxes(data: bytes) -> list:
+    """Return list of top-level ISOBMFF boxes: {fourcc, offset, size, payload}."""
+    boxes, i = [], 0
+    while i + 8 <= len(data):
+        size   = struct.unpack('>I', data[i:i+4])[0]
+        fourcc = data[i+4:i+8].decode('latin-1')
+        if size == 1:       # 64-bit extended size
+            if i + 16 > len(data): break
+            size, = struct.unpack('>Q', data[i+8:i+16])
+            payload_start = i + 16
+        elif size == 0:     # box runs to EOF
+            size          = len(data) - i
+            payload_start = i + 8
+        else:
+            payload_start = i + 8
+        if size < 8 or i + size > len(data):
+            break
+        boxes.append({
+            'fourcc':  fourcc,
+            'offset':  i,
+            'size':    size,
+            'payload': data[payload_start: i + size],
+        })
+        i += size
+    return boxes
+
+
+def parse_mvhd(payload: bytes) -> dict:
+    """Parse mvhd FullBox payload → {timescale, duration_ticks, duration_sec, next_track_id}."""
+    version = payload[0]
+    if version == 1:
+        # 64-bit: v(1)+f(3)+create(8)+modify(8)+timescale(4)+duration(8)+...+next_track_id(4)
+        timescale,     = struct.unpack('>I', payload[20:24])
+        duration,      = struct.unpack('>Q', payload[24:32])
+        next_track_id, = struct.unpack('>I', payload[108:112])
+    else:
+        # 32-bit: v(1)+f(3)+create(4)+modify(4)+timescale(4)+duration(4)+...+next_track_id(4)
+        timescale,     = struct.unpack('>I', payload[12:16])
+        duration,      = struct.unpack('>I', payload[16:20])
+        next_track_id, = struct.unpack('>I', payload[96:100])
+    return {
+        'timescale':      timescale,
+        'duration_ticks': duration,
+        'duration_sec':   duration / timescale if timescale else 0,
+        'next_track_id':  next_track_id,
+    }
+
+
+def _patch_stco(moov_bytes: bytes, delta: int) -> bytes:
+    """
+    Find every stco box in moov_bytes via pattern search and add delta to each
+    chunk offset.  Pattern search avoids container-walking errors and works
+    regardless of nesting depth.
+    """
+    buf = bytearray(moov_bytes)
+    pos = 0
+    while True:
+        idx = bytes(buf).find(b'stco', pos)
+        if idx < 4 or idx == -1:
+            break
+        box_start = idx - 4                 # size field is 4 bytes before fourcc
+        box_size  = struct.unpack('>I', bytes(buf[box_start:box_start+4]))[0]
+        # Sanity: stco FullBox is at least 16 bytes and must fit in the buffer
+        if box_size < 16 or box_start + box_size > len(buf):
+            pos = idx + 4
+            continue
+        # FullBox layout: [size(4)][stco(4)][version+flags(4)][entry_count(4)][offsets…]
+        count = struct.unpack('>I', bytes(buf[box_start+12:box_start+16]))[0]
+        for j in range(count):
+            off_pos = box_start + 16 + j * 4
+            if off_pos + 4 <= box_start + box_size:
+                old = struct.unpack('>I', bytes(buf[off_pos:off_pos+4]))[0]
+                buf[off_pos:off_pos+4] = struct.pack('>I', old + delta)
+        pos = idx + 4
+    return bytes(buf)
+
+
+def apply_faststart_python(file_data: bytes) -> bytes:
+    """
+    Pure-Python faststart: move moov to immediately after ftyp and shift
+    all stco chunk offsets by moov_size to compensate.
+
+    Unlike 'ffmpeg -movflags +faststart', this preserves custom tracks
+    (e.g. mett) that ffmpeg may silently drop with -c copy.
+    """
+    boxes = parse_mp4_boxes(file_data)
+    ftyp_box = next((b for b in boxes if b['fourcc'] == 'ftyp'), None)
+    moov_box = next((b for b in boxes if b['fourcc'] == 'moov'), None)
+    if not ftyp_box or not moov_box:
+        print('  ⚠️  faststart: ftyp or moov not found — skipping')
+        return file_data
+    # Already faststart?
+    if len(boxes) >= 2 and boxes[1]['fourcc'] == 'moov':
+        return file_data
+
+    moov_raw     = file_data[moov_box['offset']: moov_box['offset'] + moov_box['size']]
+    moov_patched = _patch_stco(moov_raw, moov_box['size'])   # shift = moov_size
+
+    ftyp_raw = file_data[ftyp_box['offset']: ftyp_box['offset'] + ftyp_box['size']]
+    other    = b''.join(
+        file_data[b['offset']: b['offset'] + b['size']]
+        for b in boxes if b['fourcc'] not in ('ftyp', 'moov')
+    )
+    return ftyp_raw + moov_patched + other
+
+
+def build_haptic_trak(track_id: int, movie_timescale: int, movie_duration_ticks: int,
+                      ahap_data: bytes, ahap_offset: int) -> bytes:
+    """
+    Build a complete 'trak' box for a timed metadata track carrying AHAP JSON.
+      handler_type = 'mett'  (ISO 14496-12 timed metadata)
+      content_type = 'application/json'
+      Single sample at t=0 spanning the full video duration.
+
+    Reading on each platform:
+      iOS     → AVAsset + AVAssetReader (mediaType: .metadata)
+      Android → MediaExtractor, track selected by handler type 'mett'
+    """
+    media_timescale = 1000                    # milliseconds
+    media_duration  = int(movie_duration_ticks / movie_timescale * media_timescale)
+    content_type    = b'application/json\x00'
+
+    # tkhd — Track Header (flags=3: enabled + in_movie)
+    tkhd = isobmff_fullbox('tkhd', 0, 3, (
+        struct.pack('>II', 0, 0)                 +  # creation, modification time
+        struct.pack('>I',  track_id)             +  # track_id
+        struct.pack('>I',  0)                    +  # reserved
+        struct.pack('>I',  movie_duration_ticks) +  # duration in movie timescale
+        b'\x00' * 8                              +  # reserved (8 bytes)
+        struct.pack('>hh', 0, 0)                 +  # layer, alternate_group
+        struct.pack('>HH', 0, 0)                 +  # volume=0, reserved
+        struct.pack('>9i',                          # identity matrix (36 bytes)
+                    0x00010000, 0, 0,
+                    0, 0x00010000, 0,
+                    0, 0, 0x40000000)             +
+        struct.pack('>II', 0, 0)                    # width=0, height=0
+    ))
+
+    # mdhd — Media Header
+    mdhd = isobmff_fullbox('mdhd', 0, 0, (
+        struct.pack('>II', 0, 0)                 +  # creation, modification
+        struct.pack('>I',  media_timescale)      +  # timescale = 1000
+        struct.pack('>I',  media_duration)       +  # duration
+        struct.pack('>H',  0x55C4)               +  # language = 'und'
+        struct.pack('>H',  0)                       # pre_defined
+    ))
+
+    # hdlr — Handler Reference
+    hdlr = isobmff_fullbox('hdlr', 0, 0, (
+        struct.pack('>I',   0)                   +  # pre_defined
+        b'mett'                                  +  # handler_type
+        struct.pack('>III', 0, 0, 0)             +  # reserved
+        b'Haptic Metadata\x00'                      # name
+    ))
+
+    # nmhd — Null Media Header (required for metadata tracks)
+    nmhd = isobmff_fullbox('nmhd', 0, 0, b'')
+
+    # dinf → dref → url  (self-contained: data is in this file)
+    url  = isobmff_fullbox('url ', 0, 1, b'')       # flags=1: same file, no URL string
+    dref = isobmff_fullbox('dref', 0, 0, struct.pack('>I', 1) + url)
+    dinf = isobmff_box('dinf', dref)
+
+    # stsd → mett sample entry
+    mett_entry = isobmff_box('mett', (
+        b'\x00' * 6                              +  # reserved (6 bytes)
+        struct.pack('>H', 1)                     +  # data_reference_index = 1
+        content_type                                # 'application/json\0'
+    ))
+    stsd = isobmff_fullbox('stsd', 0, 0, struct.pack('>I', 1) + mett_entry)
+
+    # stts — Time-to-Sample: 1 sample spanning the full media duration
+    stts = isobmff_fullbox('stts', 0, 0,
+        struct.pack('>I',  1)                    +  # entry_count = 1
+        struct.pack('>II', 1, media_duration)       # sample_count=1, sample_delta
+    )
+
+    # stsc — Sample-to-Chunk: 1 sample per chunk
+    stsc = isobmff_fullbox('stsc', 0, 0,
+        struct.pack('>I',   1)                   +  # entry_count = 1
+        struct.pack('>III', 1, 1, 1)                # first_chunk, samples_per_chunk, desc_idx
+    )
+
+    # stsz — Sample Sizes: 1 sample
+    stsz = isobmff_fullbox('stsz', 0, 0,
+        struct.pack('>I', 0)                     +  # sample_size = 0 (variable)
+        struct.pack('>I', 1)                     +  # sample_count = 1
+        struct.pack('>I', len(ahap_data))           # entry_size[0]
+    )
+
+    # stco — Chunk Offsets: absolute file offset where AHAP data starts
+    stco = isobmff_fullbox('stco', 0, 0,
+        struct.pack('>I', 1)                     +  # entry_count = 1
+        struct.pack('>I', ahap_offset)              # chunk_offset[0]
+    )
+
+    stbl = isobmff_box('stbl', stsd + stts + stsc + stsz + stco)
+    minf = isobmff_box('minf', nmhd + dinf + stbl)
+    mdia = isobmff_box('mdia', mdhd + hdlr + minf)
+    return isobmff_box('trak', tkhd + mdia)
+
+
+def inject_haptic_into_mp4(input_path: str, ahap_json: str, output_path: str) -> None:
+    """
+    Inject AHAP haptic data as an ISOBMFF timed metadata track into an MP4 file.
+
+    Output file layout:
+      [all non-moov boxes from input]  ← video/audio data untouched
+      [mdat: AHAP JSON bytes]          ← new haptic data appended
+      [moov: original + haptic trak]   ← moov rebuilt at end
+
+    Requirement: moov must be at the end of the input file (standard ffmpeg output).
+    Faststart files (moov at start) are rejected with a conversion hint.
+    """
+    with open(input_path, 'rb') as f:
+        mp4_data = f.read()
+
+    boxes = parse_mp4_boxes(mp4_data)
+    if not boxes:
+        print('  ⚠️  No ISOBMFF boxes found — is this a valid MP4?')
+        return
+
+    moov_box = next((b for b in boxes if b['fourcc'] == 'moov'), None)
+    if not moov_box:
+        print('  ⚠️  moov box not found — skipping MP4 injection')
+        return
+
+    # If moov is at the start (faststart), remux with ffmpeg to move it to the end.
+    # This preserves stco offsets correctly in the output file.
+    if boxes[-1]['fourcc'] != 'moov':
+        print('  ℹ️  moov is at start (faststart) — auto-remuxing to standard layout…')
+        tmp_path = input_path + '._nofs.mp4'
+        result   = subprocess.run(
+            ['ffmpeg', '-y', '-i', input_path, '-c', 'copy', tmp_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f'  ⚠️  ffmpeg remux failed:\n{result.stderr[-300:]}')
+            return
+        with open(tmp_path, 'rb') as f:
+            mp4_data = f.read()
+        os.remove(tmp_path)
+        boxes    = parse_mp4_boxes(mp4_data)
+        moov_box = next((b for b in boxes if b['fourcc'] == 'moov'), None)
+        if not moov_box or boxes[-1]['fourcc'] != 'moov':
+            print('  ⚠️  moov still not at end after remux — skipping MP4 injection')
+            return
+        print('  ✅ Remux done — moov now at end')
+
+    moov_children = parse_mp4_boxes(moov_box['payload'])
+    mvhd_box      = next((b for b in moov_children if b['fourcc'] == 'mvhd'), None)
+    if not mvhd_box:
+        print('  ⚠️  mvhd not found inside moov — skipping MP4 injection')
+        return
+
+    mvhd = parse_mvhd(mvhd_box['payload'])
+    print(f'  Movie: timescale={mvhd["timescale"]}, '
+          f'duration={mvhd["duration_sec"]:.3f}s, '
+          f'next_track_id={mvhd["next_track_id"]}')
+
+    ahap_data = ahap_json.encode('utf-8')
+
+    # Collect all non-moov content — existing stco offsets remain valid
+    non_moov = b''.join(
+        mp4_data[b['offset']: b['offset'] + b['size']]
+        for b in boxes if b['fourcc'] != 'moov'
+    )
+
+    # AHAP data starts at: len(non_moov) + 8 (mdat box header size)
+    ahap_offset = len(non_moov) + 8
+    ahap_mdat   = isobmff_box('mdat', ahap_data)
+
+    haptic_trak = build_haptic_trak(
+        track_id             = mvhd['next_track_id'],
+        movie_timescale      = mvhd['timescale'],
+        movie_duration_ticks = mvhd['duration_ticks'],
+        ahap_data            = ahap_data,
+        ahap_offset          = ahap_offset,
+    )
+
+    # Append haptic trak to existing moov payload — no other boxes modified
+    new_moov = isobmff_box('moov', moov_box['payload'] + haptic_trak)
+
+    print(f'  ✅ MP4 haptic track injected')
+    print(f'     AHAP: {len(ahap_data)} bytes at file offset {ahap_offset}')
+    print(f'     Track ID: {mvhd["next_track_id"]}  |  handler: mett  |  content-type: application/json')
+
+    # Apply pure-Python faststart: move moov to file start so AVFoundation can load
+    # it over plain HTTP (python -m http.server) without needing Range request support.
+    # (ffmpeg faststart silently drops custom 'mett' tracks — hence pure Python here.)
+    print(f'  Applying faststart (moov → file start)…')
+    raw       = non_moov + ahap_mdat + new_moov
+    faststart = apply_faststart_python(raw)
+
+    with open(output_path, 'wb') as f:
+        f.write(faststart)
+
+    # Verify: check the fourcc of the second top-level box (should be moov)
+    second_fourcc = faststart[36:40].decode('latin-1', errors='replace') if len(faststart) >= 40 else '?'
+    if second_fourcc == 'moov':
+        print(f'  ✅ Faststart verified: [ftyp][moov][…] ✓')
+    else:
+        print(f'  ⚠️  Second box is {second_fourcc!r}, expected moov')
 
 
 # ============================================================================
@@ -566,7 +892,7 @@ def main():
     playlist = segment_video(args.input, args.output, args.segment_duration)
 
     # Step 2 — EXT-X-DATERANGE in m3u8 (primary, seek-safe)
-    inject_daterange_into_m3u8(playlist, ahap_json)
+    inject_daterange_into_m3u8(playlist)
 
     # Step 3 — proper ID3 PES in first TS segment (live streaming path)
     first_ts = os.path.join(args.output, 'segment_000.ts')
@@ -581,14 +907,21 @@ def main():
     # Step 4 — sidecar copy (direct-fetch fallback)
     dest = os.path.join(args.output, 'haptic.ahap')
     shutil.copy2(args.ahap, dest)
-    print(f'[4/4] Sidecar copy → {os.path.basename(dest)}')
+    print(f'[4/5] Sidecar copy → {os.path.basename(dest)}')
+
+    # Step 5 — MP4 timed metadata track (cross-platform: iOS + Android)
+    mp4_out = os.path.join(args.output, 'output_with_haptics.mp4')
+    print(f'[5/5] Injecting ISOBMFF timed metadata track → {os.path.basename(mp4_out)}')
+    inject_haptic_into_mp4(args.input, ahap_json, mp4_out)
 
     print()
     print('Done.')
-    print(f'  Playlist : {playlist}')
-    print(f'  Methods  : EXT-X-DATERANGE + proper ID3 PES (0x15) + sidecar')
+    print(f'  HLS playlist : {playlist}')
+    print(f'  MP4 (cross-platform) : {mp4_out}')
+    print(f'  Methods  : EXT-X-DATERANGE URL ref + ID3 PES (0x15) + sidecar + MP4 mett track')
     print()
-    print(f'  cd {args.output} && python3 -m http.server 8080')
+    print(f'  cd {args.output} && python3 ../serve.py 8080')
+    print(f'  (serve.py handles Range requests — required for MP4 over HTTP)')
 
 
 if __name__ == '__main__':

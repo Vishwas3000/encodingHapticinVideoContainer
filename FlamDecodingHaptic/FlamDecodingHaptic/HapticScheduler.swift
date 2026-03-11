@@ -51,8 +51,13 @@ class HapticScheduler {
             self?.startEngine()
             self?.onEngineReset?()             // tell VC to reprepare at current time
         }
-        engine?.stoppedHandler = { reason in
-            print("⏹  [Haptic] Engine stopped: \(reason.rawValue)")
+        engine?.stoppedHandler = { [weak self] reason in
+            print("⏹  [Haptic] Engine stopped: \(reason.rawValue) — restarting")
+            self?.engineStarted = false
+            self?.isReady       = false
+            self?.patternPlayer = nil
+            self?.startEngine()
+            self?.onEngineReset?()
         }
 
         startEngine()
@@ -103,23 +108,25 @@ class HapticScheduler {
 
     /// Called after engine reset: rebuild the pattern player from the cached pattern
     /// and resume at `offset` (current video position).
-    func reprepare(at offset: TimeInterval) {
-        print("🔄 [Haptic] reprepare(at: \(String(format: "%.3f", offset))s)")
+    /// Rebuild the pattern player from the cached pattern after engine reset.
+    /// - Parameters:
+    ///   - offset: Video position to seek haptics to.
+    ///   - play: If true, starts playback immediately. Pass false when video is paused.
+    func reprepare(at offset: TimeInterval, play shouldPlay: Bool = true) {
+        print("🔄 [Haptic] reprepare(at: \(String(format: "%.3f", offset))s, play: \(shouldPlay))")
         guard let pattern = cachedPattern else {
             print("⚠️  [Haptic] No cached pattern — cannot reprepare")
             return
         }
         guard engineStarted else {
             print("⚠️  [Haptic] Engine not ready yet — reprepare deferred")
-            // Engine is still starting; once it finishes the completion handler
-            // calls onEngineReset again — VC will retry.
             return
         }
         do {
             patternPlayer = try engine?.makeAdvancedPlayer(with: pattern)
             isReady = true
             print("🟢 [Haptic] Pattern player rebuilt")
-            play(at: offset)
+            if shouldPlay { play(at: offset) }
         } catch {
             print("🔴 [Haptic] reprepare failed: \(error)")
         }
