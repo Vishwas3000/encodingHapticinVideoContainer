@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"\nimport json\nwith open\\('/Users/sudeepsharma/Documents/GitHub/HapticEncoding/assets/haptic.ahap'\\) as f:\n    ahap = json.load\\(f\\)\nevents = [e['Event'] for e in ahap['Pattern'] if 'Event' in e]\ntimes = sorted\\(e['Time'] for e in events\\)\nprint\\(f'Total events : {len\\(times\\)}'\\)\nprint\\(f'Time range   : {times[0]:.3f}s → {times[-1]:.3f}s'\\)\nprint\\(\\)\nprint\\('Events between 15s and 25s:'\\)\nfor e in events:\n    if 15 <= e['Time'] <= 25:\n        intensity = next\\(\\(p[\\\\\"ParameterValue\\\\\"] for p in e.get\\(\\\\\"EventParameters\\\\\",[]\\) if p[\\\\\"ParameterID\\\\\"]==\\\\\"HapticIntensity\\\\\"\\), None\\)\n        print\\(f'  t={e[\\\\\"Time\\\\\"]:.3f}s  type={e[\\\\\"EventType\\\\\"]}  intensity={intensity}'\\)\n\")",
+      "Bash(python3 -c \"\nimport json\nwith open\\('/Users/sudeepsharma/Documents/GitHub/HapticEncoding/assets/haptic.ahap'\\) as f:\n    ahap = json.load\\(f\\)\nevents = [e['Event'] for e in ahap['Pattern'] if 'Event' in e]\nprint\\('Events 15s-25s with full detail:'\\)\nfor e in events:\n    if 15 <= e['Time'] <= 25:\n        params = {p['ParameterID']: p['ParameterValue'] for p in e.get\\('EventParameters',[]\\)}\n        dur = e.get\\('EventDuration', 'N/A'\\)\n        print\\(f'  t={e[\\\\\"Time\\\\\"]:.3f}s  dur={dur}  {e[\\\\\"EventType\\\\\"]}  intensity={params.get\\(\\\\\"HapticIntensity\\\\\",\\\\\"?\\\\\"\\)}  sharpness={params.get\\(\\\\\"HapticSharpness\\\\\",\\\\\"?\\\\\"\\)}'\\)\n\")"
+    ]
+  }
+}
