@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-serve.py — HTTP server with Range request support for HLS + MP4 media serving.
+serve.py — HTTP server with Range + CORS support for HLS, MP4, and DASH media serving.
 
-python3 -m http.server does NOT handle HTTP Range requests, which causes
-AVFoundation to fail loading MP4 files with -12939 "byte range length mismatch".
+python3 -m http.server does NOT handle:
+  • HTTP Range requests  → AVFoundation fails with -12939 "byte range length mismatch"
+  • CORS headers         → Web player fails when opened from file:// or different origin
 
 Usage (from hls_output/ directory):
   python3 ../serve.py [port]          # default port 8080
@@ -14,7 +15,27 @@ import sys
 
 
 class RangeHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-    """SimpleHTTPRequestHandler extended with HTTP Range (partial content) support."""
+    """SimpleHTTPRequestHandler extended with Range (RFC 7233) and CORS support.
+
+    Range support:
+      Responds to 'Range: bytes=start-end' with 206 Partial Content.
+      Required by AVFoundation for MP4 probing and by the web haptic player.
+
+    CORS support:
+      Sends Access-Control-Allow-Origin: * on every response so
+      haptic_web_player.html works when opened from file:// or any origin.
+    """
+
+    def _cors_headers(self):
+        self.send_header('Access-Control-Allow-Origin',   '*')
+        self.send_header('Access-Control-Allow-Headers',  'Range')
+        self.send_header('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length')
+
+    def do_OPTIONS(self):
+        """Preflight CORS request — browsers send this before cross-origin Range fetches."""
+        self.send_response(204)
+        self._cors_headers()
+        self.end_headers()
 
     def do_GET(self):
         path = self.translate_path(self.path)
@@ -52,6 +73,7 @@ class RangeHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
                     self.send_header('Content-Range',  f'bytes {start}-{end}/{file_size}')
                     self.send_header('Content-Length', str(length))
                     self.send_header('Accept-Ranges',  'bytes')
+                    self._cors_headers()
                     self.end_headers()
                     self._send_bytes(f, length)
                     return
@@ -63,6 +85,7 @@ class RangeHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-Type',   ctype)
             self.send_header('Content-Length', str(file_size))
             self.send_header('Accept-Ranges',  'bytes')
+            self._cors_headers()
             self.end_headers()
             self.copyfile(f, self.wfile)
 
@@ -94,8 +117,9 @@ if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     handler = RangeHTTPRequestHandler
     with http.server.ThreadingHTTPServer(('', port), handler) as httpd:
-        print(f'Serving on http://0.0.0.0:{port}  (Range requests supported)')
+        print(f'Serving on http://0.0.0.0:{port}  (Range + CORS supported)')
         print(f'Run from hls_output/  →  cd hls_output && python3 ../serve.py {port}')
+        print(f'Web player →  http://localhost:{port}/haptic_web_player.html')
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:

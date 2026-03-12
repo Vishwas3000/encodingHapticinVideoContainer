@@ -864,12 +864,116 @@ def inject_haptic_into_mp4(input_path: str, ahap_json: str, output_path: str) ->
 
 
 # ============================================================================
+# DASH segmentation + EventStream haptic injection
+# ============================================================================
+
+def parse_iso8601_duration(s: str) -> float:
+    """Parse ISO 8601 duration like 'PT1M23.456S' → total seconds."""
+    m = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?', s or '')
+    if not m:
+        return 0.0
+    h   = float(m.group(1) or 0)
+    mn  = float(m.group(2) or 0)
+    sec = float(m.group(3) or 0)
+    return h * 3600 + mn * 60 + sec
+
+
+def segment_video_dash(input_path: str, output_dir: str, segment_duration: int = 6) -> str:
+    """
+    Generate a DASH stream (MPD + init + segment files) using ffmpeg.
+
+    Output layout inside output_dir:
+      stream.mpd                  ← DASH manifest
+      init_<id>.mp4               ← initialization segment (codec headers)
+      seg_<id>_<num>.m4s          ← media segments
+
+    Returns the path to stream.mpd, or '' on failure.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    mpd_path = os.path.join(output_dir, 'stream.mpd')
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', input_path,
+        '-c:v', 'libx264', '-c:a', 'aac',
+        '-f', 'dash',
+        '-seg_duration',   str(segment_duration),
+        '-init_seg_name',  'init_$RepresentationID$.mp4',
+        '-media_seg_name', 'seg_$RepresentationID$_$Number%05d$.m4s',
+        '-use_template',   '1',
+        '-use_timeline',   '1',
+        mpd_path,
+    ]
+    print(f'[6/6] Segmenting video → DASH ({output_dir})')
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f'  ⚠️  ffmpeg DASH failed:\n{result.stderr[-500:]}')
+        return ''
+    print(f'  ✅ DASH segments generated')
+    return mpd_path
+
+
+def inject_haptics_into_mpd(mpd_path: str, ahap_filename: str = 'haptic.ahap') -> None:
+    """
+    Inject an EventStream element into the DASH MPD so clients learn the
+    haptic sidecar URL directly from the manifest — same role as
+    EXT-X-DATERANGE in HLS.
+
+    Layout inserted as first child of <Period> (before any <AdaptationSet>):
+
+      <EventStream schemeIdUri="urn:hapticencoding:haptics:2024"
+                   timescale="1000" value="haptics">
+        <Event id="0" presentationTime="0"
+               duration="{total_ms}" messageData="haptic.ahap"/>
+      </EventStream>
+
+    Web client parses this with DOMParser — no DASH library required.
+    iOS/Android clients can extend their DASH parsers similarly.
+    """
+    if not os.path.isfile(mpd_path):
+        print(f'  ⚠️  MPD not found: {mpd_path}')
+        return
+
+    with open(mpd_path) as f:
+        content = f.read()
+
+    # Read total duration from mediaPresentationDuration attribute
+    dur_m   = re.search(r'mediaPresentationDuration="([^"]+)"', content)
+    dur_sec = parse_iso8601_duration(dur_m.group(1)) if dur_m else 60.0
+    dur_ms  = int(dur_sec * 1000)
+
+    event_stream = (
+        f'    <EventStream schemeIdUri="urn:hapticencoding:haptics:2024"'
+        f' timescale="1000" value="haptics">\n'
+        f'      <Event id="0" presentationTime="0"'
+        f' duration="{dur_ms}" messageData="{ahap_filename}"/>\n'
+        f'    </EventStream>\n'
+    )
+
+    if '<AdaptationSet' not in content:
+        print('  ⚠️  No <AdaptationSet> found in MPD — skipping EventStream injection')
+        return
+
+    # Insert before the first <AdaptationSet so it's the first child of <Period>
+    content = content.replace('<AdaptationSet', event_stream + '    <AdaptationSet', 1)
+
+    with open(mpd_path, 'w') as f:
+        f.write(content)
+
+    print(
+        f'  ✅ DASH EventStream injected → stream.mpd\n'
+        f'     schemeIdUri=urn:hapticencoding:haptics:2024\n'
+        f'     duration={dur_sec:.1f}s  messageData="{ahap_filename}"'
+    )
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Embed AHAP haptics into an HLS stream (EXT-X-DATERANGE + proper PES).'
+        description='Embed AHAP haptics into HLS, MP4, and DASH streams.'
     )
     parser.add_argument('--input',            required=True)
     parser.add_argument('--ahap',             required=True)
@@ -914,14 +1018,29 @@ def main():
     print(f'[5/5] Injecting ISOBMFF timed metadata track → {os.path.basename(mp4_out)}')
     inject_haptic_into_mp4(args.input, ahap_json, mp4_out)
 
+    # Step 6 — DASH stream with EventStream haptic injection
+    dash_dir = os.path.join(args.output, 'dash')
+    mpd_path = segment_video_dash(args.input, dash_dir, args.segment_duration)
+    if mpd_path:
+        shutil.copy2(args.ahap, os.path.join(dash_dir, 'haptic.ahap'))
+        inject_haptics_into_mpd(mpd_path)
+        # Copy web player into output root for easy browser testing
+    web_player_src = os.path.join(os.path.dirname(__file__), 'haptic_web_player.html')
+    web_player_dst = os.path.join(args.output, 'haptic_web_player.html')
+    if os.path.isfile(web_player_src):
+        shutil.copy2(web_player_src, web_player_dst)
+        print(f'  ✅ Web player copied → haptic_web_player.html')
+
     print()
     print('Done.')
-    print(f'  HLS playlist : {playlist}')
+    print(f'  HLS playlist         : {playlist}')
     print(f'  MP4 (cross-platform) : {mp4_out}')
-    print(f'  Methods  : EXT-X-DATERANGE URL ref + ID3 PES (0x15) + sidecar + MP4 mett track')
+    print(f'  DASH manifest        : {mpd_path or "(skipped — ffmpeg DASH failed)"}')
+    print(f'  Methods  : EXT-X-DATERANGE + ID3 PES (0x15) + sidecar + MP4 mett + DASH EventStream')
     print()
     print(f'  cd {args.output} && python3 ../serve.py 8080')
-    print(f'  (serve.py handles Range requests — required for MP4 over HTTP)')
+    print(f'  Then open: http://localhost:8080/haptic_web_player.html')
+    print(f'  (serve.py handles Range + CORS — required for MP4 and web player)')
 
 
 if __name__ == '__main__':

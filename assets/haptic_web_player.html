@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Haptic Video Player — Web POC</title>
+
+  <!-- hls.js: HLS playback on Chrome / Firefox / Edge (Safari plays HLS natively) -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
+  <!-- shaka-player: DASH playback via MSE (Chrome / Firefox / Edge / Safari 17+) -->
+  <script src="https://cdn.jsdelivr.net/npm/shaka-player@latest/dist/shaka-player.compiled.min.js"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; }
+
+    h1 { padding: 14px 16px 8px; font-size: 16px; font-weight: 600; color: #fff; }
+
+    .row { display: flex; align-items: center; gap: 8px; padding: 4px 16px 10px; flex-wrap: wrap; }
+    .row label { color: #999; font-size: 12px; white-space: nowrap; }
+    .row input { background: #1e1e1e; border: 1px solid #3a3a3a; border-radius: 5px; color: #fff;
+                 padding: 5px 10px; font-size: 12px; width: 230px; }
+    .btn { background: #2563eb; border: none; border-radius: 5px; color: #fff;
+           padding: 5px 14px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+    .btn:hover { background: #1d4ed8; }
+    .btn.secondary { background: #374151; }
+    .btn.secondary:hover { background: #4b5563; }
+
+    .tabs { display: flex; border-bottom: 1px solid #2a2a2a; padding: 0 16px; }
+    .tab { background: none; border: none; color: #888; padding: 8px 18px; cursor: pointer;
+           font-size: 13px; border-bottom: 2px solid transparent; transition: all .12s; }
+    .tab.active { color: #fff; border-bottom-color: #2563eb; }
+    .tab:hover:not(.active) { color: #bbb; }
+
+    .player-wrap { position: relative; background: #000; margin: 10px 16px 0;
+                   border-radius: 8px; overflow: hidden; aspect-ratio: 16/9; max-height: 340px; }
+    video { width: 100%; height: 100%; display: block; object-fit: contain; }
+
+    /* Haptic pulse overlay — bottom-right of player */
+    .haptic-overlay { position: absolute; bottom: 10px; right: 10px; display: flex;
+                      align-items: center; gap: 7px; background: rgba(0,0,0,.75);
+                      border-radius: 20px; padding: 4px 12px; pointer-events: none; }
+    .haptic-dot { width: 9px; height: 9px; border-radius: 50%; background: #333;
+                  transition: background .04s, transform .04s; flex-shrink: 0; }
+    .haptic-dot.fire-transient  { background: #f59e0b; transform: scale(1.8); }
+    .haptic-dot.fire-continuous { background: #60a5fa; transform: scale(1.5); }
+    #hapticLabel { color: #aaa; font-size: 11px; font-family: 'SF Mono', monospace; }
+
+    .status { padding: 6px 16px; color: #60a5fa; font-size: 12px; min-height: 24px; }
+
+    /* Haptic timeline bar */
+    .timeline-wrap { margin: 4px 16px; height: 24px; position: relative;
+                     background: #0d0d0d; border-radius: 4px; overflow: hidden; }
+    #timelineBar { height: 100%; background: transparent; position: relative; }
+    .tick { position: absolute; top: 0; width: 2px; height: 100%; opacity: 0.5; transition: opacity .1s; }
+    .tick.transient  { background: #f59e0b; }
+    .tick.continuous { background: #60a5fa; }
+    .tick.active { opacity: 1; }
+    #timelineCursor { position: absolute; top: 0; width: 1px; height: 100%; background: #fff; opacity: .5; }
+
+    /* Log */
+    .log-wrap { margin: 4px 16px; background: #0a0a0a; border: 1px solid #1f1f1f;
+                border-radius: 6px; height: 200px; overflow-y: auto; }
+    #log { padding: 6px 8px; font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+           font-size: 10.5px; line-height: 1.65; }
+    #log .e { padding: 0; }
+    #log .info    { color: #4ade80; }
+    #log .haptic  { color: #f59e0b; }
+    #log .net     { color: #818cf8; }
+    #log .warn    { color: #fb923c; }
+    #log .err     { color: #f87171; }
+
+    /* Compat table */
+    .compat-wrap { padding: 10px 16px 20px; }
+    .compat-wrap h3 { font-size: 12px; color: #888; margin-bottom: 8px; letter-spacing: .04em; text-transform: uppercase; }
+    table.compat { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+    table.compat th { background: #1a1a1a; padding: 6px 8px; text-align: left; color: #888; font-weight: 500; }
+    table.compat td { padding: 5px 8px; border-top: 1px solid #1a1a1a; color: #ccc; }
+    .yes     { color: #4ade80; }
+    .no      { color: #f87171; }
+    .partial { color: #fb923c; }
+  </style>
+</head>
+<body>
+
+<h1>Haptic Video Player — Web POC</h1>
+
+<div class="row">
+  <label>Server:
+    <input id="serverInput" value="" placeholder="http://192.168.x.x:8080">
+  </label>
+  <button class="btn" id="loadBtn">Load</button>
+  <button class="btn secondary" id="stopBtn">Stop</button>
+  <button class="btn secondary" id="testHapticBtn">Test Haptic</button>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-mode="mp4">MP4  <small style="color:#666">(mett track)</small></button>
+  <button class="tab" data-mode="hls">HLS  <small style="color:#666">(EXT-X-DATERANGE)</small></button>
+  <button class="tab" data-mode="dash">DASH  <small style="color:#666">(EventStream)</small></button>
+</div>
+
+<div class="player-wrap">
+  <video id="video" controls playsinline crossorigin="anonymous"></video>
+  <div class="haptic-overlay">
+    <div class="haptic-dot" id="hapticDot"></div>
+    <span id="hapticLabel">no haptics</span>
+  </div>
+</div>
+
+<!-- Haptic event timeline: each AHAP event is a tick; cursor shows current position -->
+<div class="timeline-wrap" title="Haptic event timeline">
+  <div id="timelineBar"></div>
+  <div id="timelineCursor"></div>
+</div>
+
+<div class="status" id="status">Select a mode and tap Load</div>
+
+<div class="log-wrap"><div id="log"></div></div>
+
+<div class="compat-wrap">
+  <h3>Browser compatibility</h3>
+  <table class="compat">
+    <thead>
+      <tr>
+        <th>Feature</th>
+        <th>Chrome / Brave</th>
+        <th>Firefox</th>
+        <th>Safari macOS</th>
+        <th>Safari iOS</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>MP4 playback</td>
+        <td class="yes">Yes</td><td class="yes">Yes</td>
+        <td class="yes">Yes</td><td class="yes">Yes</td>
+      </tr>
+      <tr>
+        <td>MP4 mett extraction (3 Range requests)</td>
+        <td class="yes">Yes</td><td class="yes">Yes</td>
+        <td class="yes">Yes</td><td class="yes">Yes</td>
+      </tr>
+      <tr>
+        <td>HLS playback</td>
+        <td class="yes">Yes (hls.js)</td><td class="yes">Yes (hls.js)</td>
+        <td class="yes">Native</td><td class="yes">Native</td>
+      </tr>
+      <tr>
+        <td>HLS EXT-X-DATERANGE haptics</td>
+        <td class="yes">Yes (manifest fetch)</td><td class="yes">Yes (manifest fetch)</td>
+        <td class="yes">Yes (manifest fetch)</td><td class="yes">Yes (manifest fetch)</td>
+      </tr>
+      <tr>
+        <td>DASH playback</td>
+        <td class="yes">Yes (shaka)</td><td class="yes">Yes (shaka)</td>
+        <td class="yes">Yes (shaka)</td><td class="partial">Limited</td>
+      </tr>
+      <tr>
+        <td>DASH EventStream haptics</td>
+        <td class="yes">Yes (MPD fetch)</td><td class="yes">Yes (MPD fetch)</td>
+        <td class="yes">Yes (MPD fetch)</td><td class="yes">Yes (MPD fetch)</td>
+      </tr>
+      <tr>
+        <td>navigator.vibrate()</td>
+        <td class="partial">No-op on desktop; works on Android</td>
+        <td class="partial">No-op on desktop; works on Android</td>
+        <td class="no">Not supported</td>
+        <td class="no">Not supported</td>
+      </tr>
+      <tr>
+        <td>Visual haptic indicator + timeline</td>
+        <td class="yes">Yes</td><td class="yes">Yes</td>
+        <td class="yes">Yes</td><td class="yes">Yes</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+'use strict';
+
+// ── Config ─────────────────────────────────────────────────────────────────────
+let BASE = window.location.origin;
+document.getElementById('serverInput').value = BASE;
+let currentMode = 'mp4';
+let hlsInstance = null;
+let shakaPlayer = null;
+const t0 = performance.now();
+
+// ── Log ────────────────────────────────────────────────────────────────────────
+function log(msg, cls = 'info') {
+  const ms  = (performance.now() - t0).toFixed(0);
+  const el  = document.getElementById('log');
+  const div = Object.assign(document.createElement('div'), { className: `e ${cls}` });
+  div.textContent = `[+${ms}ms] ${msg}`;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
+  console.log(div.textContent);
+}
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+
+// ── Binary helpers ─────────────────────────────────────────────────────────────
+function u32be(buf, off) {
+  return ((buf[off] << 24) | (buf[off+1] << 16) | (buf[off+2] << 8) | buf[off+3]) >>> 0;
+}
+
+function findStr(buf, str, from = 0) {
+  const b = [...str].map(c => c.charCodeAt(0));
+  outer: for (let i = from; i <= buf.length - b.length; i++) {
+    for (let j = 0; j < b.length; j++) if (buf[i+j] !== b[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+
+// ── Range fetch ────────────────────────────────────────────────────────────────
+async function fetchRange(url, start, end) {
+  log(`[net] GET bytes=${start}-${end}  ${url.split('/').pop()}`, 'net');
+  const r = await fetch(url, { headers: { Range: `bytes=${start}-${end}` } });
+  if (!r.ok && r.status !== 206) throw new Error(`HTTP ${r.status} for range ${start}-${end}`);
+  return new Uint8Array(await r.arrayBuffer());
+}
+
+// ── AHAP parser ────────────────────────────────────────────────────────────────
+function parseAHAP(json) {
+  const { Pattern } = JSON.parse(json);
+  return (Pattern || [])
+    .filter(p => p.Event)
+    .map(({ Event: e }) => ({
+      type:      e.EventType || 'HapticTransient',
+      time:      e.Time      || 0,
+      duration:  e.EventDuration ?? 0.1,
+      intensity: e.EventParameters?.find(p => p.ParameterID === 'HapticIntensity')?.ParameterValue ?? 1.0,
+      sharpness: e.EventParameters?.find(p => p.ParameterID === 'HapticSharpness')?.ParameterValue ?? 0.5,
+    }))
+    .sort((a, b) => a.time - b.time);
+}
+
+// ── Haptic indicator ───────────────────────────────────────────────────────────
+let _hapticTimer = null;
+let _vibrateEndsAt = 0;
+const VIBRATE_MIN_GAP_MS = 80;
+
+function fireHapticVisual(e) {
+  const dot   = document.getElementById('hapticDot');
+  const label = document.getElementById('hapticLabel');
+  const cls   = e.type === 'HapticContinuous' ? 'fire-continuous' : 'fire-transient';
+  dot.className = `haptic-dot ${cls}`;
+  label.textContent = `${e.type === 'HapticContinuous' ? '■' : '●'} i=${e.intensity.toFixed(2)} s=${e.sharpness.toFixed(2)}`;
+  clearTimeout(_hapticTimer);
+  _hapticTimer = setTimeout(() => {
+    dot.className = 'haptic-dot';
+    label.textContent = 'idle';
+  }, Math.max(80, e.duration * 1000));
+
+  if (navigator.vibrate) {
+    let ms;
+    if (e.type === 'HapticTransient') {
+      ms = Math.round(80 + 120 * e.intensity);
+    } else {
+      ms = Math.max(200, Math.round(e.duration * 1000));
+    }
+
+    const now = performance.now();
+    const remaining = _vibrateEndsAt - now;
+    if (remaining > VIBRATE_MIN_GAP_MS) {
+      log(`[haptic] skipped (motor busy, ${remaining.toFixed(0)}ms left)`, 'haptic');
+    } else {
+      const ok = navigator.vibrate(ms);
+      if (ok) {
+        _vibrateEndsAt = now + ms;
+      } else {
+        log('[haptic] vibrate() returned false — blocked by browser', 'warn');
+      }
+    }
+  }
+
+  log(`[haptic] ${e.type} t=${e.time.toFixed(3)}s  i=${e.intensity.toFixed(2)}  dur=${e.duration.toFixed(3)}s`, 'haptic');
+}
+
+// ── Timeline visualisation ─────────────────────────────────────────────────────
+function buildTimeline(events, totalDuration) {
+  const bar    = document.getElementById('timelineBar');
+  const cursor = document.getElementById('timelineCursor');
+  bar.innerHTML = '';
+  if (!totalDuration || totalDuration <= 0) return;
+
+  events.forEach((e, i) => {
+    const tick = document.createElement('div');
+    tick.className = `tick ${e.type === 'HapticContinuous' ? 'continuous' : 'transient'}`;
+    tick.style.left = `${(e.time / totalDuration) * 100}%`;
+    if (e.type === 'HapticContinuous')
+      tick.style.width = `${Math.max(2, (e.duration / totalDuration) * 100)}%`;
+    tick.dataset.idx = i;
+    bar.appendChild(tick);
+  });
+
+  bar.appendChild(cursor);
+}
+
+function updateTimelineCursor(currentTime, totalDuration) {
+  if (!totalDuration) return;
+  document.getElementById('timelineCursor').style.left =
+    `${Math.min(100, (currentTime / totalDuration) * 100)}%`;
+}
+
+// ── Web haptic scheduler ───────────────────────────────────────────────────────
+// Uses requestAnimationFrame to check video.currentTime each display frame.
+// Fires haptic events as the cursor crosses them.
+// On seek: re-arms only future events, skips past ones.
+const scheduler = (() => {
+  let _video    = null;
+  let _events   = [];
+  let _fired    = new Set();
+  let _lastTime = -1;
+  let _raf      = null;
+
+  function _tick() {
+    if (!_video) { _raf = requestAnimationFrame(_tick); return; }
+
+    const t = _video.currentTime;
+    updateTimelineCursor(t, _video.duration);
+
+    for (let i = 0; i < _events.length; i++) {
+      if (_fired.has(i)) continue;
+      const e = _events[i];
+      // Fire if we just crossed this event (within one-frame window back)
+      if (e.time <= t && e.time > _lastTime - 0.016) {
+        fireHapticVisual(e);
+        _fired.add(i);
+        // Highlight tick on timeline
+        const tick = document.querySelector(`[data-idx="${i}"]`);
+        if (tick) { tick.classList.add('active'); setTimeout(() => tick.classList.remove('active'), 300); }
+      }
+    }
+    _lastTime = t;
+    _raf = requestAnimationFrame(_tick);
+  }
+
+  return {
+    load(video, events) {
+      _video  = video;
+      _events = events;
+      _fired  = new Set();
+      _lastTime = -1;
+      // Pre-mark events that are already in the past
+      this.seek(video.currentTime);
+    },
+    start() {
+      if (_raf) cancelAnimationFrame(_raf);
+      _raf = requestAnimationFrame(_tick);
+    },
+    stop() {
+      if (_raf) { cancelAnimationFrame(_raf); _raf = null; }
+    },
+    seek(newTime) {
+      _fired.clear();
+      _events.forEach((e, i) => { if (e.time < newTime - 0.05) _fired.add(i); });
+      _lastTime = newTime;
+    },
+  };
+})();
+
+// ── AHAP load helper ───────────────────────────────────────────────────────────
+function loadAHAP(json, video) {
+  const events = parseAHAP(json);
+  log(`[ahap] Parsed ${events.length} haptic events`, 'info');
+  scheduler.load(video, events);
+  scheduler.start();
+  buildTimeline(events, video.duration || 0);
+  // Rebuild timeline once duration is known if not yet available
+  if (!video.duration) {
+    video.addEventListener('loadedmetadata', () => buildTimeline(events, video.duration), { once: true });
+  }
+  setStatus(`Haptics ready — ${events.length} events`);
+}
+
+// ── Video event wiring ─────────────────────────────────────────────────────────
+function wireVideo(video) {
+  video.addEventListener('seeking', () => {
+    scheduler.seek(video.currentTime);
+    log(`[seek] → ${video.currentTime.toFixed(3)}s`);
+  });
+  video.addEventListener('play',  () => scheduler.start());
+  video.addEventListener('ended', () => scheduler.stop());
+  video.addEventListener('error', () => {
+    const e = video.error;
+    log(`[video] Error code=${e?.code} — ${e?.message}`, 'err');
+    setStatus(`Video error: ${e?.message ?? 'unknown'}`);
+  });
+}
+
+// ── MP4: 3-request Range extraction ───────────────────────────────────────────
+//
+//  Request 1: bytes=0-39   → parse ftyp box size (4 bytes) + moov box header (8 bytes)
+//  Request 2: bytes=0-{ftyp+moov-1}  → download exact ftyp+moov (no wasted bytes)
+//  Request 3: bytes={ahapOffset}-{ahapOffset+ahapSize-1}  → AHAP JSON
+//
+//  Works for any video size — no hardcoded 512KB cap.
+
+function parseMettStcoStsz(bytes) {
+  // 1. Find 'mett' handler type string inside hdlr box
+  const mettIdx = findStr(bytes, 'mett');
+  if (mettIdx < 0) throw new Error("'mett' not found in moov — file has no haptic track");
+
+  // 2. Find 'stsz' AFTER 'mett' (stbl order: stsd → stts → stsc → stsz → stco)
+  const stszIdx = findStr(bytes, 'stsz', mettIdx);
+  if (stszIdx < 4) throw new Error("'stsz' not found after mett");
+  const stszStart = stszIdx - 4;
+  if (stszStart + 24 > bytes.length) throw new Error('stsz box truncated in moov window');
+
+  // stsz FullBox offsets from box start:
+  //   [0] size(4)  [4] 'stsz'(4)  [8] version+flags(4)
+  //   [12] sample_size(4)  [16] sample_count(4)  [20] entry_size[0](4)
+  const uniformSize = u32be(bytes, stszStart + 12);
+  const ahapSize    = uniformSize > 0 ? uniformSize : u32be(bytes, stszStart + 20);
+  if (ahapSize === 0) throw new Error('stsz: zero AHAP sample size');
+
+  // 3. Find 'stco' AFTER 'stsz'
+  const stcoIdx = findStr(bytes, 'stco', stszIdx + 4);
+  if (stcoIdx < 4) throw new Error("'stco' not found after stsz");
+  const stcoStart = stcoIdx - 4;
+  if (stcoStart + 20 > bytes.length) throw new Error('stco box truncated in moov window');
+
+  // stco FullBox: [0] size(4) [4] 'stco'(4) [8] version+flags(4) [12] entry_count(4) [16] offset[0](4)
+  const entryCount = u32be(bytes, stcoStart + 12);
+  if (entryCount < 1) throw new Error('stco: no chunk offset entries');
+  const ahapOffset = u32be(bytes, stcoStart + 16);
+
+  return { ahapOffset, ahapSize };
+}
+
+async function extractFromMP4(url) {
+  // ── Request 1: probe ─────────────────────────────────────────────────────────
+  const probe    = await fetchRange(url, 0, 39);
+  const ftypSize = u32be(probe, 0);
+  const ftypFcc  = String.fromCharCode(probe[4], probe[5], probe[6], probe[7]);
+  if (ftypFcc !== 'ftyp') throw new Error(`Expected 'ftyp' at offset 0, got '${ftypFcc}'`);
+  if (ftypSize + 8 > probe.length) throw new Error(`ftyp (${ftypSize}B) too large for 40-byte probe`);
+
+  const moovOff  = ftypSize;
+  const moovFcc  = String.fromCharCode(probe[moovOff+4], probe[moovOff+5], probe[moovOff+6], probe[moovOff+7]);
+  if (moovFcc !== 'moov') throw new Error(`Expected 'moov' at offset ${moovOff}, got '${moovFcc}'`);
+  const moovSize = u32be(probe, moovOff);
+  log(`[mp4] ftyp=${ftypSize}B  moov=${(moovSize/1024).toFixed(1)}KB`, 'info');
+
+  // ── Request 2: exact ftyp + moov ─────────────────────────────────────────────
+  const header = await fetchRange(url, 0, ftypSize + moovSize - 1);
+
+  // ── Parse mett → stsz → stco ─────────────────────────────────────────────────
+  const { ahapOffset, ahapSize } = parseMettStcoStsz(header);
+  log(`[mp4] stco offset=${ahapOffset}  stsz size=${ahapSize}`, 'info');
+
+  // ── Request 3: AHAP bytes ─────────────────────────────────────────────────────
+  const ahapBytes = await fetchRange(url, ahapOffset, ahapOffset + ahapSize - 1);
+  return new TextDecoder().decode(ahapBytes);
+}
+
+// ── HLS: manual manifest fetch → X-HAPTICS-URL ────────────────────────────────
+//
+//  AVFoundation delivers this via AVPlayerItemMetadataCollector.
+//  On the web: we just fetch the .m3u8 text and regex-match the attribute.
+//  Works on all browsers — no JS API needed for EXT-X-DATERANGE parsing.
+
+async function extractFromHLS(m3u8Url) {
+  log(`[hls] Fetching manifest: ${m3u8Url.split('/').pop()}`, 'net');
+  const r    = await fetch(m3u8Url);
+  if (!r.ok) throw new Error(`m3u8 HTTP ${r.status}`);
+  const text = await r.text();
+  log(`[hls] Manifest ${text.length} chars received`, 'info');
+
+  const m = text.match(/X-HAPTICS-URL="([^"]+)"/);
+  if (!m) throw new Error('EXT-X-DATERANGE with X-HAPTICS-URL not found in manifest');
+
+  const ahapUrl = new URL(m[1], m3u8Url).href;
+  log(`[hls] X-HAPTICS-URL → ${ahapUrl}`, 'info');
+
+  const ar = await fetch(ahapUrl);
+  if (!ar.ok) throw new Error(`AHAP fetch HTTP ${ar.status}`);
+  return ar.text();
+}
+
+// ── DASH: MPD fetch → EventStream messageData ─────────────────────────────────
+//
+//  Standard DASH mechanism: EventStream element inside <Period>.
+//  schemeIdUri="urn:hapticencoding:haptics:2024"
+//  Event/@messageData = relative URL to haptic.ahap
+//
+//  Parsed via DOMParser — no DASH library needed for haptic extraction.
+//  Works on all browsers.
+
+async function extractFromDASH(mpdUrl) {
+  log(`[dash] Fetching MPD: ${mpdUrl.split('/').pop()}`, 'net');
+  const r   = await fetch(mpdUrl);
+  if (!r.ok) throw new Error(`MPD HTTP ${r.status}`);
+  const xml = await r.text();
+  log(`[dash] MPD ${xml.length} chars`, 'info');
+
+  const mpdBase = mpdUrl.substring(0, mpdUrl.lastIndexOf('/') + 1);
+  let ahapUrl = null;
+
+  try {
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    const parseErr = doc.querySelector('parsererror');
+    if (parseErr) throw new Error('XML parse error: ' + parseErr.textContent.slice(0, 80));
+
+    let streams = [...doc.getElementsByTagNameNS('*', 'EventStream')];
+    if (!streams.length) streams = [...doc.querySelectorAll('EventStream')];
+    log(`[dash] Found ${streams.length} EventStream element(s)`, 'info');
+
+    const target = streams.find(s => s.getAttribute('schemeIdUri') === 'urn:hapticencoding:haptics:2024');
+    if (target) {
+      const ev = target.getElementsByTagNameNS('*', 'Event')[0] || target.querySelector('Event');
+      const messageData = ev?.getAttribute('messageData');
+      if (messageData) {
+        ahapUrl = new URL(messageData, mpdUrl).href;
+        log(`[dash] EventStream → ${ahapUrl}`, 'info');
+      } else {
+        log('[dash] <Event> missing messageData', 'warn');
+      }
+    } else {
+      log('[dash] No haptic EventStream in MPD — trying sidecar haptic.ahap', 'warn');
+    }
+  } catch (xmlErr) {
+    log(`[dash] MPD parse failed: ${xmlErr.message} — trying sidecar`, 'warn');
+  }
+
+  if (!ahapUrl) {
+    ahapUrl = mpdBase + 'haptic.ahap';
+    log(`[dash] Fallback sidecar → ${ahapUrl}`, 'info');
+  }
+
+  const ar = await fetch(ahapUrl);
+  if (!ar.ok) throw new Error(`AHAP fetch HTTP ${ar.status} for ${ahapUrl}`);
+  return ar.text();
+}
+
+// ── Mode: MP4 ─────────────────────────────────────────────────────────────────
+async function setupMP4() {
+  const url   = `${BASE}/output_with_haptics.mp4`;
+  const video = document.getElementById('video');
+  log(`[mode] MP4 — ${url}`, 'info');
+  setStatus('Extracting AHAP from mett track…');
+  video.src = url;
+  wireVideo(video);
+  video.load();
+
+  try {
+    const json = await extractFromMP4(url);
+    log(`[mp4] AHAP extracted (${json.length} chars)`, 'info');
+    loadAHAP(json, video);
+    video.play().catch(() => {});
+  } catch (err) {
+    log(`[mp4] mett extraction failed: ${err.message}`, 'warn');
+    log(`[mp4] Falling back to sidecar haptic.ahap…`, 'warn');
+    setStatus('mett parse failed — trying sidecar…');
+    try {
+      const r = await fetch(`${BASE}/haptic.ahap`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      loadAHAP(await r.text(), video);
+      video.play().catch(() => {});
+    } catch (e2) {
+      log(`[mp4] Sidecar failed: ${e2.message}`, 'err');
+      setStatus('Failed to load haptics');
+    }
+  }
+}
+
+// ── Mode: HLS ─────────────────────────────────────────────────────────────────
+async function setupHLS() {
+  const m3u8  = `${BASE}/stream.m3u8`;
+  const video = document.getElementById('video');
+  log(`[mode] HLS — ${m3u8}`, 'info');
+  setStatus('Fetching HLS manifest…');
+  wireVideo(video);
+
+  // Haptic extraction: manual manifest parse (all browsers)
+  try {
+    const json = await extractFromHLS(m3u8);
+    loadAHAP(json, video);
+  } catch (err) {
+    log(`[hls] Haptic extraction failed: ${err.message}`, 'warn');
+    setStatus(`Haptics failed: ${err.message}`);
+  }
+
+  // Video playback
+  if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+    // Chrome, Firefox, Edge
+    log('[hls] Playback via hls.js', 'info');
+    hlsInstance = new Hls({ enableWorker: true });
+    hlsInstance.loadSource(m3u8);
+    hlsInstance.attachMedia(video);
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+    hlsInstance.on(Hls.Events.ERROR, (_, d) => {
+      if (d.fatal) log(`[hls] Fatal: ${d.type}/${d.details}`, 'err');
+    });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    // Safari (HLS native)
+    log('[hls] Playback via Safari native HLS', 'info');
+    video.src = m3u8;
+    video.play().catch(() => {});
+  } else {
+    log('[hls] HLS not supported on this browser', 'err');
+    setStatus('HLS playback not supported');
+  }
+}
+
+// ── Mode: DASH ────────────────────────────────────────────────────────────────
+async function setupDASH() {
+  const mpdUrl = `${BASE}/dash/stream.mpd`;
+  const video  = document.getElementById('video');
+  log(`[mode] DASH — ${mpdUrl}`, 'info');
+  setStatus('Fetching DASH MPD…');
+  wireVideo(video);
+
+  // Haptic extraction: manual MPD parse (all browsers)
+  try {
+    const json = await extractFromDASH(mpdUrl);
+    loadAHAP(json, video);
+  } catch (err) {
+    log(`[dash] Haptic extraction failed: ${err.message}`, 'warn');
+    setStatus(`Haptics failed: ${err.message}`);
+  }
+
+  // Video playback via shaka-player (MSE — Chrome/Firefox/Edge/Safari 17+)
+  if (typeof shaka !== 'undefined' && shaka.Player.isBrowserSupported()) {
+    log('[dash] Playback via shaka-player', 'info');
+    try {
+      shaka.polyfill.installAll();
+      shakaPlayer = new shaka.Player(video);
+      shakaPlayer.addEventListener('error', e =>
+        log(`[dash] shaka error: ${e.detail?.message ?? e.detail?.code}`, 'err')
+      );
+      await shakaPlayer.load(mpdUrl);
+      log('[dash] Stream loaded', 'info');
+      video.play().catch(() => {});
+    } catch (err) {
+      log(`[dash] shaka load failed: ${err.message}`, 'err');
+      setStatus('DASH playback failed (haptic extraction still works — see log)');
+    }
+  } else {
+    log('[dash] shaka-player unavailable or browser not supported for DASH', 'warn');
+    setStatus('DASH video unsupported on this browser — haptic data extracted OK');
+  }
+}
+
+// ── Teardown ───────────────────────────────────────────────────────────────────
+function tearDown() {
+  scheduler.stop();
+  const video = document.getElementById('video');
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  if (hlsInstance)  { hlsInstance.destroy();         hlsInstance = null; }
+  if (shakaPlayer)  { shakaPlayer.destroy().catch(() => {}); shakaPlayer = null; }
+  document.getElementById('log').innerHTML       = '';
+  document.getElementById('hapticLabel').textContent = 'no haptics';
+  document.getElementById('hapticDot').className  = 'haptic-dot';
+  document.getElementById('timelineBar').innerHTML = '';
+  setStatus('Ready');
+}
+
+// ── Controller ─────────────────────────────────────────────────────────────────
+async function load() {
+  BASE = document.getElementById('serverInput').value.replace(/\/+$/, '');
+  tearDown();
+  try {
+    if (currentMode === 'mp4')  await setupMP4();
+    if (currentMode === 'hls')  await setupHLS();
+    if (currentMode === 'dash') await setupDASH();
+  } catch (err) {
+    log(`[main] Unexpected error: ${err.message}`, 'err');
+    setStatus(`Error: ${err.message}`);
+  }
+}
+
+// ── UI wiring ──────────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentMode = btn.dataset.mode;
+  });
+});
+document.getElementById('loadBtn').addEventListener('click', load);
+document.getElementById('stopBtn').addEventListener('click', tearDown);
+document.getElementById('serverInput').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+
+// ── Test Haptic button ──────────────────────────────────────────────────────────
+document.getElementById('testHapticBtn').addEventListener('click', () => {
+  if (!navigator.vibrate) {
+    log('[test] navigator.vibrate not available on this device/browser', 'err');
+    setStatus('Vibration API not supported on this browser');
+    return;
+  }
+  // Pattern: strong bump, pause, medium buzz, pause, 3 rapid taps
+  const ok = navigator.vibrate([100, 80, 200, 80, 40, 40, 40, 40, 40]);
+  log(`[test] navigator.vibrate([100,80,200,80,40,40,40,40,40]) → returned ${ok}`, ok ? 'info' : 'err');
+  if (!ok) {
+    log('[test] vibrate() returned false — browser may require a prior user interaction, or power-save mode is blocking it', 'warn');
+    setStatus('vibrate() returned false — see log');
+  } else {
+    setStatus('Test vibration sent — did you feel it?');
+  }
+  const dot = document.getElementById('hapticDot');
+  const label = document.getElementById('hapticLabel');
+  dot.className = 'haptic-dot fire-transient';
+  label.textContent = '● TEST';
+  setTimeout(() => { dot.className = 'haptic-dot'; label.textContent = 'idle'; }, 600);
+});
+
+// Detect vibration support and note it
+if (!navigator.vibrate) {
+  log('[compat] navigator.vibrate not available — visual indicator only', 'warn');
+} else {
+  log('[compat] navigator.vibrate available', 'info');
+}
+</script>
+</body>
+</html>
