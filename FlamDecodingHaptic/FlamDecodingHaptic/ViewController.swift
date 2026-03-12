@@ -26,8 +26,8 @@ class ViewController: UIViewController {
     enum PlaybackMode { case hls, mp4 }
     private var playbackMode: PlaybackMode = .hls
 
-    private let hlsURLString     = "http://192.168.1.17:8080/stream.m3u8"
-    private let mp4URLString    = "http://192.168.1.17:8080/output_with_haptics.mp4"             // cars.mp4 in bundle
+    private let hlsURLString     = "http://192.168.1.87:8080/stream.m3u8"
+    private let mp4URLString    = "http://192.168.1.87:8080/output_with_haptics.mp4"             // cars.mp4 in bundle
     private let ahapBundleFile   = "haptic"           // haptic.ahap in bundle
 
     // t0: reference clock set when the player is first created.
@@ -416,30 +416,66 @@ class ViewController: UIViewController {
         }
     }
 
-    /// HTTP path: download just the moov header, parse mett stco/stsz, then
-    /// fetch the AHAP sample bytes with a single Range request.
+    /// HTTP path: probe the moov box size first, then download exactly ftyp+moov,
+    /// parse mett stco/stsz, and fetch only the AHAP bytes.
+    ///
+    /// 3 Range requests total — works for any video size:
+    ///   Request 1: bytes=0-39   → read ftyp size + moov box header
+    ///   Request 2: bytes=0-(ftyp_size+moov_size-1)  → exact ftyp+moov bytes
+    ///   Request 3: bytes=ahapOffset-(ahapOffset+ahapSize-1)  → AHAP JSON
+    ///
     /// Returns true if AHAP was successfully loaded.
     private func fetchAHAPFromRemoteMett(url: URL) async -> Bool {
-        // Step 1 — download the first 512 KB (covers ftyp + moov for most files)
-        let headerSize = 512 * 1024
-        var headerReq  = URLRequest(url: url)
-        headerReq.setValue("bytes=0-\(headerSize - 1)", forHTTPHeaderField: "Range")
+        // ── Step 1: probe — read first 40 bytes to locate moov box header ──────
+        var probeReq = URLRequest(url: url)
+        probeReq.setValue("bytes=0-39", forHTTPHeaderField: "Range")
+        guard let (probeData, _) = try? await URLSession.shared.data(for: probeReq),
+              probeData.count >= 16 else { return false }
 
+        // Parse ftyp box size (first 4 bytes, big-endian)
+        let ftypSize = Int(probeData.readUInt32BE(at: 0))
+        guard ftypSize >= 8, ftypSize + 8 <= probeData.count else {
+            print("⚠️  [MP4] ftyp parse failed (ftypSize=\(ftypSize))")
+            return false
+        }
+
+        // moov box header starts immediately after ftyp
+        let moovHeaderOffset = ftypSize
+        guard probeData.count >= moovHeaderOffset + 8 else {
+            print("⚠️  [MP4] probe too short to read moov header")
+            return false
+        }
+        let moovFourcc = String(bytes: probeData[moovHeaderOffset+4..<moovHeaderOffset+8], encoding: .ascii) ?? ""
+        guard moovFourcc == "moov" else {
+            print("⚠️  [MP4] expected 'moov' at offset \(moovHeaderOffset), got '\(moovFourcc)'")
+            return false
+        }
+        let moovSize = Int(probeData.readUInt32BE(at: moovHeaderOffset))
+        guard moovSize > 8 else { return false }
+
+        print("🟢 [MP4] ftyp=\(ftypSize)B moov=\(moovSize)B — fetching exact header…")
+        log("[\(ms())] 📐 moov=\(moovSize / 1024)KB — range-fetching…")
+
+        // ── Step 2: download exactly ftyp + moov ─────────────────────────────
+        let moovEnd = ftypSize + moovSize - 1
+        var headerReq = URLRequest(url: url)
+        headerReq.setValue("bytes=0-\(moovEnd)", forHTTPHeaderField: "Range")
         guard let (headerData, _) = try? await URLSession.shared.data(for: headerReq),
-              headerData.count > 16 else { return false }
+              headerData.count >= ftypSize + moovSize else {
+            print("⚠️  [MP4] moov download incomplete (\(0) bytes expected \(ftypSize + moovSize))")
+            return false
+        }
 
-        // Step 2 — locate moov inside the downloaded header
+        // ── Step 3: parse mett stco/stsz from the complete moov ──────────────
         guard let (ahapOffset, ahapSize) = parseMettStcoStsz(from: headerData) else {
-            print("⚠️  [MP4] Could not parse mett stco/stsz from moov header")
+            print("⚠️  [MP4] Could not parse mett stco/stsz from moov")
             return false
         }
         print("🟢 [MP4] mett stco offset=\(ahapOffset) size=\(ahapSize)")
 
-        // Step 3 — Range-fetch the AHAP sample bytes
+        // ── Step 4: fetch just the AHAP bytes ────────────────────────────────
         var ahapReq = URLRequest(url: url)
-        let endByte = ahapOffset + ahapSize - 1
-        ahapReq.setValue("bytes=\(ahapOffset)-\(endByte)", forHTTPHeaderField: "Range")
-
+        ahapReq.setValue("bytes=\(ahapOffset)-\(ahapOffset + ahapSize - 1)", forHTTPHeaderField: "Range")
         guard let (ahapData, resp) = try? await URLSession.shared.data(for: ahapReq),
               (resp as? HTTPURLResponse)?.statusCode == 206,
               !ahapData.isEmpty else { return false }
